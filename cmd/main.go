@@ -1,7 +1,6 @@
 package main
 
 import (
-	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -13,8 +12,8 @@ import (
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/cli-runtime/pkg/genericclioptions"
-	"k8s.io/client-go/kubernetes/scheme"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/util/homedir"
 	"k8s.io/klog/v2"
@@ -127,7 +126,7 @@ func parseCliArgs() (*cobra.Command, error) {
 				return nil
 			}
 
-			conf, err := loadConfig(cfgFile)
+			conf, err := loadConfig(cfgFile, cmd.Flags().Changed("config"))
 			if err != nil {
 				return err
 			}
@@ -183,13 +182,18 @@ func parseCliArgs() (*cobra.Command, error) {
 	return rootCmd, nil
 }
 
-func loadConfig(configPath string) (*gitopszombiesv1.Config, error) {
+func loadConfig(configPath string, explicitPath bool) (*gitopszombiesv1.Config, error) {
 	_, err := os.Stat(configPath)
 	if err != nil {
 		if os.IsNotExist(err) {
-			klog.V(1).Infof("Can't find config file at %s", configPath)
-			return &gitopszombiesv1.Config{}, nil
+			if !explicitPath {
+				klog.V(1).Infof("Can't find config file at %s", configPath)
+				return &gitopszombiesv1.Config{}, nil
+			}
+
+			return nil, fmt.Errorf("config file %q does not exist: %w", configPath, err)
 		}
+
 		return nil, err
 	}
 
@@ -198,14 +202,17 @@ func loadConfig(configPath string) (*gitopszombiesv1.Config, error) {
 		return nil, err
 	}
 
-	err = gitopszombiesv1.AddToScheme(scheme.Scheme)
+	scheme := runtime.NewScheme()
+	err = gitopszombiesv1.AddToScheme(scheme)
 	if err != nil {
 		return nil, err
 	}
 
-	obj, err := runtime.Decode(scheme.Codecs.UniversalDeserializer(), json)
+	// Strict decoding rejects misspelled or unknown fields instead of silently ignoring them.
+	codecs := serializer.NewCodecFactory(scheme, serializer.EnableStrict)
+	obj, err := runtime.Decode(codecs.UniversalDeserializer(), json)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("could not decode config file %q: %w", configPath, err)
 	}
 
 	var cfg gitopszombiesv1.Config
@@ -213,8 +220,7 @@ func loadConfig(configPath string) (*gitopszombiesv1.Config, error) {
 	case *gitopszombiesv1.Config:
 		cfg = *o
 	default:
-		err = errors.New("unsupported config")
-		return nil, err
+		return nil, fmt.Errorf("config file %q: unsupported config", configPath)
 	}
 
 	return &cfg, nil

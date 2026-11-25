@@ -69,6 +69,70 @@ excludeResources:
   cluster: management
 ```
 
+### Exclusion rule semantics
+
+Each entry of `excludeResources` is matched against every discovered resource. All fields of a rule have to
+match for the rule to exclude a resource.
+
+| Field         | Interpreted as                             |
+| ------------- | ------------------------------------------ |
+| `cluster`     | regular expression                         |
+| `namespace`   | regular expression                         |
+| `name`        | regular expression                         |
+| `labels`      | map of label keys to regular expressions   |
+| `annotations` | map of annotation keys to regular expressions |
+| `apiVersion`  | literal string (not a regular expression)  |
+| `kind`        | literal string (not a regular expression)  |
+
+`cluster` matches the name of the cluster as resolved from the kubeconfig used by the Kustomizations. The
+local cluster is always named `self`.
+
+Regular expressions are implicitly anchored: a pattern has to match the complete value. The pattern is wrapped
+in a non-capturing group, so an alternation such as `velero-.*|backup` is equivalent to
+`^(?:velero-.*|backup)$` and matches `backup` but not `backup-old`. Note that `.*` still matches everything -
+use it only if that is intended.
+
+An empty `cluster`, `namespace` or `name` means "any value". For `labels` and `annotations` the key has to be
+present on the resource; an empty value (`labels: {app: ""}`) only matches an empty label value, not any value.
+
+Rules are validated before any cluster is contacted:
+
+* An invalid regular expression is a startup error. The message contains the rule index, the field and the
+  original expression, and all problems of all rules are reported at once.
+* A rule with no fields set at all is rejected, because it would exclude every resource and silently disable
+  zombie detection. Use an explicit match-all rule instead:
+  ```yaml
+  excludeResources:
+  - name: ".*"
+  ```
+
+The config file is decoded strictly. Unknown fields - including misspelled ones such as `excludeResource` - and
+duplicate keys are startup errors. This is stricter than previous versions, which silently ignored unknown
+fields; see [Upgrading from earlier versions](#upgrading-from-earlier-versions).
+
+An explicitly passed `--config` path has to exist; only the default `~/.gitops-zombies.yaml` may be absent, in
+which case an empty config is used.
+
+### Upgrading from earlier versions
+
+Earlier versions silently ignored unknown config fields. The following kinds of configuration now fail to
+start instead of being partially applied:
+
+* Misspelled top-level keys, for example `excludeResource`, `excludeCluster` (singular), `includeall`.
+* Misspelled rule fields, for example `nmae`, `namespaces`, `label`.
+* Fields that never existed on `Config` or on an exclusion rule, for example `metadata`, `selector` on a rule.
+* Duplicate keys in the same mapping, for example two `fail:` entries.
+* Invalid regular expressions in `cluster`, `namespace`, `name`, `labels` and `annotations`.
+* Empty exclusion rules (`- {}`), which previously excluded all resources.
+
+Check each config file before upgrading. The config is loaded and validated during a regular run, before any
+cluster is contacted, so a failing run reports the problem even when the cluster is unreachable.
+
+Unknown-field rejection is a deliberate hard error rather than a one-release warning: a warning would leave
+the run proceeding with an exclusion silently not applied, and the resulting zombie list would look plausible
+while being wrong. A misspelled `excludeResources` entry is not something that can be detected after the fact
+by the user, so failing at startup is the only reliable signal.
+
 ## CLI reference
 
 ```

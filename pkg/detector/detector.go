@@ -50,6 +50,7 @@ type Detector struct {
 	kubeconfigArgs         *genericclioptions.ConfigFlags
 	printFlags             *k8sget.PrintFlags
 	conf                   *gitopszombiesv1.Config
+	exclusionRules         []collector.ExclusionRule
 }
 
 // New creates a new detection object.
@@ -58,6 +59,12 @@ func New(
 	kubeconfigArgs *genericclioptions.ConfigFlags,
 	printFlags *k8sget.PrintFlags,
 ) (*Detector, error) {
+	// Validate and precompile the exclusion rules before any cluster is contacted.
+	exclusionRules, err := collector.CompileExclusions(conf.ExcludeResources)
+	if err != nil {
+		return nil, err
+	}
+
 	gitopsDynClient, err := getDynClient(kubeconfigArgs)
 	if err != nil {
 		return nil, err
@@ -86,6 +93,7 @@ func New(
 		conf:                   conf,
 		kubeconfigArgs:         kubeconfigArgs,
 		printFlags:             printFlags,
+		exclusionRules:         exclusionRules,
 	}, nil
 }
 
@@ -187,7 +195,7 @@ func (d *Detector) detectZombiesOnCluster(
 		collector.IgnoreHelmSecret(),
 		collector.IgnoreIfHelmReleaseFound(helmReleases),
 		collector.IgnoreIfKustomizationFound(kustomizations),
-		collector.IgnoreRuleExclusions(clusterName, d.conf.ExcludeResources),
+		collector.IgnoreRuleExclusions(clusterName, d.exclusionRules),
 	)
 
 	var list []*metav1.APIResourceList

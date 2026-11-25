@@ -3,7 +3,12 @@ package collector
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"maps"
 	"regexp"
+	"slices"
+	"strings"
 
 	helmapi "github.com/fluxcd/helm-controller/api/v2"
 	ksapi "github.com/fluxcd/kustomize-controller/api/v1"
@@ -161,106 +166,264 @@ func IgnoreIfKustomizationFound(kustomizations []ksapi.Kustomization) FilterFunc
 	}
 }
 
-// IgnoreRuleExclusions returns a FilterFunc which excludes resources part of configuration exclusions.
-func IgnoreRuleExclusions(cluster string, exclusions []v1.ExcludeResources) FilterFunc {
+// ErrEmptyExclusionRule is returned for an excludeResources rule whose fields are all empty. Such a rule
+// would match every resource and silently disable zombie detection, therefore it is rejected. Use an
+// explicit match-all pattern such as `name: ".*"` instead.
+var ErrEmptyExclusionRule = errors.New(
+	`rule is empty and would exclude every resource; use an explicit match-all pattern such as name: ".*"`,
+)
+
+// ExclusionRuleError describes a single problem in a single excludeResources rule.
+type ExclusionRuleError struct {
+	// RuleIndex is the 1-based position of the rule in excludeResources.
+	RuleIndex int
+	// Field is the offending field, e.g. "cluster", "name" or `labels[app]`. It is empty for a rule
+	// which is rejected as a whole.
+	Field string
+	// Expression is the original, unmodified user supplied expression.
+	Expression string
+	// Err is the underlying cause, if any.
+	Err error
+}
+
+// Error implements the error interface.
+func (e *ExclusionRuleError) Error() string {
+	prefix := fmt.Sprintf("excludeResources[%d]", e.RuleIndex)
+	if e.Field != "" {
+		prefix += "." + e.Field
+	}
+
+	if e.Expression != "" {
+		return fmt.Sprintf("%s: invalid regular expression %q: %v", prefix, e.Expression, e.Err)
+	}
+
+	return fmt.Sprintf("%s: %v", prefix, e.Err)
+}
+
+// Unwrap returns the underlying cause.
+func (e *ExclusionRuleError) Unwrap() error {
+	return e.Err
+}
+
+// ExclusionRuleErrors aggregates every problem found while compiling excludeResources rules.
+type ExclusionRuleErrors []*ExclusionRuleError
+
+// Error implements the error interface.
+func (e ExclusionRuleErrors) Error() string {
+	messages := make([]string, 0, len(e))
+	for _, ruleErr := range e {
+		messages = append(messages, ruleErr.Error())
+	}
+
+	return strings.Join(messages, "; ")
+}
+
+// Unwrap returns the individual rule errors.
+func (e ExclusionRuleErrors) Unwrap() []error {
+	errs := make([]error, 0, len(e))
+	for _, ruleErr := range e {
+		errs = append(errs, ruleErr)
+	}
+
+	return errs
+}
+
+// ExclusionRule is a validated and precompiled excludeResources rule.
+//
+// The fields cluster, namespace, name and the values of annotations and labels are user supplied regular
+// expressions. They are anchored implicitly: a pattern p is compiled as `^(?:p)$` and therefore has to match
+// the complete value. apiVersion and kind are compared literally and are not regular expressions.
+//
+// A nil pattern for cluster, namespace or name matches everything. A nil pattern for a label or annotation
+// value only matches an empty value, mirroring the previous `^$` behaviour. The rules are immutable after
+// compilation and safe for concurrent use.
+type ExclusionRule struct {
+	cluster     *regexp.Regexp
+	namespace   *regexp.Regexp
+	name        *regexp.Regexp
+	annotations map[string]*regexp.Regexp
+	labels      map[string]*regexp.Regexp
+	apiVersion  string
+	kind        string
+}
+
+// CompileExclusions validates and precompiles all excludeResources rules.
+//
+// Every pattern is compiled exactly once. Problems are not logged but returned: all problems of all rules
+// are reported in rule order, and a single rule may contribute more than one error. Exclusive rule fields
+// are checked in the order cluster, namespace, name, annotations (sorted by key), labels (sorted by key).
+func CompileExclusions(exclusions []v1.ExcludeResources) ([]ExclusionRule, error) {
+	rules := make([]ExclusionRule, 0, len(exclusions))
+	errs := ExclusionRuleErrors{}
+
+	for idx, exclusion := range exclusions {
+		if isEmptyExclusion(exclusion) {
+			errs = append(errs, &ExclusionRuleError{
+				RuleIndex: idx + 1,
+				Err:       ErrEmptyExclusionRule,
+			})
+			continue
+		}
+
+		rule, ruleErrs := compileExclusion(idx+1, exclusion)
+		if len(ruleErrs) > 0 {
+			errs = append(errs, ruleErrs...)
+			continue
+		}
+
+		rules = append(rules, rule)
+	}
+
+	if len(errs) > 0 {
+		return nil, errs
+	}
+
+	return rules, nil
+}
+
+// IgnoreRuleExclusions returns a FilterFunc which excludes resources matching one of the precompiled rules.
+// Rules must be created with CompileExclusions so that patterns are validated and compiled only once.
+func IgnoreRuleExclusions(cluster string, rules []ExclusionRule) FilterFunc {
 	return func(res unstructured.Unstructured, _ klog.Logger) bool {
-		for _, exclusion := range exclusions {
-			if !matchesCluster(cluster, exclusion.Cluster) {
-				continue
-			}
-
-			if !resourceMatchesGetAPIVersionAndKind(res, exclusion.APIVersion, exclusion.Kind) {
-				continue
-			}
-
-			if !resourceMatchesNamespace(res, exclusion.Namespace) {
-				continue
-			}
-
-			if !resourceMatchesMetadata(res.GetAnnotations(), exclusion.Annotations) {
-				continue
-			}
-
-			if !resourceMatchesMetadata(res.GetLabels(), exclusion.Labels) {
-				continue
-			}
-
-			if resourceMatchesName(res, exclusion.Name) {
+		for i := range rules {
+			if rules[i].matches(cluster, res) {
 				return true
 			}
 		}
+
 		return false
 	}
 }
 
-func matchesCluster(cluster, clusterExclude string) bool {
-	if clusterExclude != "" {
-		match, err := regexp.MatchString(`^`+clusterExclude+`$`, cluster)
+func (r *ExclusionRule) matches(cluster string, res unstructured.Unstructured) bool {
+	switch {
+	case r.cluster != nil && !r.cluster.MatchString(cluster):
+		return false
+	case r.apiVersion != "" && res.GetAPIVersion() != r.apiVersion:
+		return false
+	case r.kind != "" && res.GetKind() != r.kind:
+		return false
+	case r.namespace != nil && !r.namespace.MatchString(res.GetNamespace()):
+		return false
+	case !metadataMatches(res.GetAnnotations(), r.annotations):
+		return false
+	case !metadataMatches(res.GetLabels(), r.labels):
+		return false
+	case r.name != nil && !r.name.MatchString(res.GetName()):
+		return false
+	}
+
+	return true
+}
+
+func isEmptyExclusion(exclusion v1.ExcludeResources) bool {
+	return exclusion.Cluster == "" &&
+		exclusion.Namespace == "" &&
+		exclusion.Name == "" &&
+		len(exclusion.Annotations) == 0 &&
+		len(exclusion.Labels) == 0 &&
+		exclusion.APIVersion == "" &&
+		exclusion.Kind == ""
+}
+
+func compileExclusion(ruleIndex int, exclusion v1.ExcludeResources) (ExclusionRule, ExclusionRuleErrors) {
+	rule := ExclusionRule{
+		apiVersion: exclusion.APIVersion,
+		kind:       exclusion.Kind,
+	}
+
+	var errs ExclusionRuleErrors
+
+	compile := func(field, expression string) *regexp.Regexp {
+		if expression == "" {
+			return nil
+		}
+
+		pattern, err := compilePattern(expression)
 		if err != nil {
-			klog.Error(err)
+			errs = append(errs, &ExclusionRuleError{
+				RuleIndex:  ruleIndex,
+				Field:      field,
+				Expression: expression,
+				Err:        err,
+			})
+			return nil
 		}
 
-		return match
+		return pattern
 	}
 
-	return true
+	rule.cluster = compile("cluster", exclusion.Cluster)
+	rule.namespace = compile("namespace", exclusion.Namespace)
+	rule.name = compile("name", exclusion.Name)
+	rule.annotations = compileMetadata(ruleIndex, "annotations", exclusion.Annotations, &errs)
+	rule.labels = compileMetadata(ruleIndex, "labels", exclusion.Labels, &errs)
+
+	return rule, errs
 }
 
-func resourceMatchesGetAPIVersionAndKind(res unstructured.Unstructured, apiVersion, kind string) bool {
-	// match all api versions
-	resVer := res.GetAPIVersion()
-	if apiVersion != "" && resVer != apiVersion {
-		return false
+func compileMetadata(
+	ruleIndex int,
+	field string,
+	metadata map[string]string,
+	errs *ExclusionRuleErrors,
+) map[string]*regexp.Regexp {
+	if len(metadata) == 0 {
+		return nil
 	}
 
-	if kind != "" && res.GetKind() != kind {
-		return false
-	}
+	patterns := make(map[string]*regexp.Regexp, len(metadata))
 
-	return true
-}
+	for _, key := range slices.Sorted(maps.Keys(metadata)) {
+		expression := metadata[key]
+		if expression == "" {
+			// An empty expression is equivalent to the old `^$` pattern: it matches only an empty value.
+			patterns[key] = nil
+			continue
+		}
 
-func resourceMatchesNamespace(res unstructured.Unstructured, namespace string) bool {
-	if namespace != "" {
-		match, err := regexp.MatchString(`^`+namespace+`$`, res.GetNamespace())
+		pattern, err := compilePattern(expression)
 		if err != nil {
-			klog.Error(err)
+			*errs = append(*errs, &ExclusionRuleError{
+				RuleIndex:  ruleIndex,
+				Field:      fmt.Sprintf("%s[%s]", field, key),
+				Expression: expression,
+				Err:        err,
+			})
+			continue
 		}
-		if !match {
-			return false
-		}
+
+		patterns[key] = pattern
 	}
 
-	return true
+	return patterns
 }
 
-func resourceMatchesMetadata(resMetadata, metadata map[string]string) bool {
-	for key, val := range metadata {
-		v, ok := resMetadata[key]
+// compilePattern anchors the user expression with a non-capturing group so that alternations cannot escape
+// the implicit anchors. The expression must not be empty; callers handle the empty case themselves.
+func compilePattern(expression string) (*regexp.Regexp, error) {
+	return regexp.Compile("^(?:" + expression + ")$")
+}
+
+func metadataMatches(resMetadata map[string]string, patterns map[string]*regexp.Regexp) bool {
+	for key, pattern := range patterns {
+		value, ok := resMetadata[key]
 		if !ok {
 			return false
 		}
 
-		match, err := regexp.MatchString(`^`+val+`$`, v)
-		if err != nil {
-			klog.Error(err)
+		// A nil pattern stems from an empty expression and matches only an empty value.
+		if pattern == nil {
+			if value != "" {
+				return false
+			}
+
+			continue
 		}
-		if !match {
+
+		if !pattern.MatchString(value) {
 			return false
 		}
-	}
-
-	return true
-}
-
-func resourceMatchesName(res unstructured.Unstructured, name string) bool {
-	if name != "" {
-		match, err := regexp.MatchString(`^`+name+`$`, res.GetName())
-		if err != nil {
-			klog.Error(err)
-		}
-
-		return match
 	}
 
 	return true
